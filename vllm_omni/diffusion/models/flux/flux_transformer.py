@@ -13,7 +13,6 @@ from diffusers.models.embeddings import (
     get_1d_rotary_pos_embed,
 )
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
-from diffusers.utils import is_torch_npu_available
 from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -462,7 +461,20 @@ class FluxPosEmbed(nn.Module):
         pos = ids.float()
         is_mps = ids.device.type == "mps"
         is_npu = ids.device.type == "npu"
-        freqs_dtype = torch.float32 if (is_mps or is_npu) else torch.float64
+        if is_npu:
+            # use_real=False builds a complex tensor via torch.polar, which
+            # torch_npu does not support; cos/sin are its real/imag parts.
+            for i in range(n_axes):
+                axis_dim = self.axes_dim[i]
+                inv_freq = 1.0 / (
+                    self.theta
+                    ** (torch.arange(0, axis_dim, 2, dtype=torch.float32, device=pos.device) / axis_dim)
+                )
+                freqs = torch.outer(pos[:, i], inv_freq)
+                cos_out.append(torch.cos(freqs))
+                sin_out.append(torch.sin(freqs))
+            return torch.cat(cos_out, dim=-1), torch.cat(sin_out, dim=-1)
+        freqs_dtype = torch.float32 if is_mps else torch.float64
         for i in range(n_axes):
             freqs_cis = get_1d_rotary_pos_embed(
                 self.axes_dim[i],
@@ -680,11 +692,9 @@ class FluxTransformer2DModel(nn.Module):
             img_ids = img_ids[0]
 
         ids = torch.cat((txt_ids, img_ids), dim=0)
-        if is_torch_npu_available():
-            freqs_cos, freqs_sin = self.pos_embed(ids.cpu())
-            image_rotary_emb = (freqs_cos.npu(), freqs_sin.npu())
-        else:
-            image_rotary_emb = self.pos_embed(ids)
+        # Keep the ids on device: no CPU round trip, and FluxPosEmbed's NPU
+        # branch computes the tables on the accelerator.
+        image_rotary_emb = self.pos_embed(ids)
 
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
