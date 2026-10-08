@@ -1,5 +1,7 @@
 from importlib.util import find_spec
 
+import os
+
 import torch
 from einops import rearrange, repeat
 from vllm.logger import init_logger
@@ -82,6 +84,32 @@ def _restore_batch_dim(x: torch.Tensor, squeezed: bool) -> torch.Tensor:
     return x
 
 
+# npu_rotary_mul takes pre-expanded (1, S, 1, D) tables, and FLUX re-slices the
+# same tables for all 57 attention blocks every step (4 calls per block), so
+# cache the expansion keyed on the table address. An entry keeps cos/sin alive,
+# which pins that address: a hit is by construction the same table.
+_ROPE_MUL_ENABLED = os.environ.get("VLLM_OMNI_ROPE_NPU_IMPL", "rotary_mul") != "mindiesd"
+_ROPE_MUL_CACHE_MAX = 8
+_rope_mul_cache = {}
+_rope_mul_order = []
+
+
+def _rope_mul_tables(cos: torch.Tensor, sin: torch.Tensor):
+    """(S, D/2) cos/sin -> the (1, S, 1, D) r1/r2 pair of npu_rotary_mul."""
+    key = (cos.data_ptr(), sin.data_ptr(), cos.shape, sin.shape, cos.dtype)
+    entry = _rope_mul_cache.get(key)
+    if entry is None:
+        seqlen = cos.shape[0]
+        r1 = cos.unsqueeze(0).unsqueeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, 2).reshape(1, seqlen, 1, -1)
+        r2 = sin.unsqueeze(0).unsqueeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, 2).reshape(1, seqlen, 1, -1)
+        entry = (r1, r2, cos, sin)
+        _rope_mul_cache[key] = entry
+        _rope_mul_order.append(key)
+        while len(_rope_mul_order) > _ROPE_MUL_CACHE_MAX:
+            _rope_mul_cache.pop(_rope_mul_order.pop(0), None)
+    return entry[0], entry[1]
+
+
 class RotaryEmbedding(CustomOp):
     """
     rotary positional embedding.
@@ -109,6 +137,9 @@ class RotaryEmbedding(CustomOp):
                 pass
         if find_spec("mindiesd") is not None:
             self.has_mindie = True
+        # v0.26.0 base class has no half_head_dim switch; its NPU path is
+        # always the half-dim (D/2) table layout.
+        self._use_rope_mul = _ROPE_MUL_ENABLED and not is_neox_style
 
     def forward_cuda(
         self,
@@ -161,10 +192,22 @@ class RotaryEmbedding(CustomOp):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        if self.has_mindie:
-            return apply_rotary_emb_mindiesd(x, cos, sin, self.interleaved)
-        else:
+        if not self.has_mindie:
             return self.forward_native(x, cos, sin)
+        if (
+            self._use_rope_mul
+            and cos.dim() == 2
+            and cos.dtype == x.dtype
+            and cos.shape[-1] * 2 == x.shape[-1]
+            and x.is_contiguous()
+        ):
+            from torch_npu import npu_rotary_mul
+
+            x4, squeezed = _ensure_batch_dim(x)
+            r1, r2 = _rope_mul_tables(cos, sin)
+            out = npu_rotary_mul(x4, r1, r2, rotary_mode="interleave")
+            return _restore_batch_dim(out, squeezed)
+        return apply_rotary_emb_mindiesd(x, cos, sin, self.interleaved)
 
     def forward_xpu(
         self,

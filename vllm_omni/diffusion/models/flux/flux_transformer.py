@@ -695,6 +695,9 @@ class FluxTransformer2DModel(nn.Module):
         # Keep the ids on device: no CPU round trip, and FluxPosEmbed's NPU
         # branch computes the tables on the accelerator.
         image_rotary_emb = self.pos_embed(ids)
+        # Cast the RoPE tables once per step; the blocks then share one table
+        # object, which keeps rope.py's npu_rotary_mul table cache warm.
+        image_rotary_emb = tuple(t.to(hidden_states.dtype) for t in image_rotary_emb)
 
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
