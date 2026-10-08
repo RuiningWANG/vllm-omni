@@ -878,6 +878,9 @@ class FluxTransformer2DModel(nn.Module):
             torch.cat([txt_freqs_cos, img_freqs_cos], dim=0),
             torch.cat([txt_freqs_sin, img_freqs_sin], dim=0),
         )
+        # Cast the RoPE tables once per step; the blocks then share one table
+        # object, which keeps rope.py's npu_rotary_mul table cache warm.
+        image_rotary_emb = tuple(t.to(hidden_states.dtype) for t in image_rotary_emb)
 
         hidden_states_mask = None
         ctx = get_forward_context()
