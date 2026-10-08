@@ -156,6 +156,15 @@ def parse_args() -> argparse.Namespace:
         help="Number of GPUs used for ring sequence parallelism.",
     )
     parser.add_argument(
+        "--allgather-degree",
+        type=int,
+        default=1,
+        help=(
+            "Number of GPUs used for AllGather-KV sequence parallelism (agkv). "
+            "Mutually exclusive with --ulysses-degree/--ring-degree > 1."
+        ),
+    )
+    parser.add_argument(
         "--cfg-parallel-size",
         type=int,
         default=1,
@@ -416,6 +425,7 @@ def main():
         "enable_cache_dit_summary": args.enable_cache_dit_summary,
         "ulysses_degree": args.ulysses_degree,
         "ring_degree": args.ring_degree,
+        "allgather_degree": args.allgather_degree,
         "ulysses_mode": args.ulysses_mode,
         "cfg_parallel_size": args.cfg_parallel_size,
         "vae_patch_parallel_size": args.vae_patch_parallel_size,
